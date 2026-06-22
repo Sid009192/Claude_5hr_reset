@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Playwright session profile (contains login cookies)
+pw-profile/
+conversation_url.txt
+
+# Markdown notes — ignore all except the GitHub README
+*.md
+!README.md
