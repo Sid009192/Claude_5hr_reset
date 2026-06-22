@@ -4,26 +4,36 @@
 
 $ErrorActionPreference = "Stop"
 
-$TaskName    = "Claude Auto Sender"
-$ProjectDir  = "D:\OJAS\Claude\5hr window reset"
-$PythonW     = Join-Path $ProjectDir ".venv\Scripts\pythonw.exe"   # no console window
-$Script      = Join-Path $ProjectDir "autosend.py"
+# ======================== EDIT THESE ========================
+# When should the FIRST run happen today? (24-hour clock)
+$StartHour      = 9     # e.g. 9  = 9 AM,  19 = 7 PM
+$StartMinute    = 0     # e.g. 0, 15, 30...
+
+# How often to repeat after the first run.
+$IntervalHours  = 5
+$IntervalMinutes = 2
+# ============================================================
+
+$TaskName   = "Claude Auto Sender"
+$ProjectDir = $PSScriptRoot           # this script's own folder — portable, no hardcoded path
+$PythonW    = Join-Path $ProjectDir ".venv\Scripts\pythonw.exe"   # no console window
+$Script     = Join-Path $ProjectDir "autosend.py"
 
 if (-not (Test-Path $PythonW)) {
     # Fall back to python.exe if pythonw is missing (will flash a brief console).
     $PythonW = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 }
 
-# What runs each fire: send one message headless, then exit.
+# What runs each fire: send one message off-screen, then exit.
 $action = New-ScheduledTaskAction `
     -Execute $PythonW `
     -Argument "`"$Script`" --once" `
     -WorkingDirectory $ProjectDir
 
-# When: first at 2:32 AM today, then repeat every 5 hours 2 minutes, ~indefinitely.
-$interval = New-TimeSpan -Hours 5 -Minutes 2
+# When: first at your chosen time today, then repeat on your interval, ~indefinitely.
+$interval = New-TimeSpan -Hours $IntervalHours -Minutes $IntervalMinutes
 $duration = New-TimeSpan -Days 3650
-$startAt  = Get-Date -Hour 2 -Minute 32 -Second 0
+$startAt  = Get-Date -Hour $StartHour -Minute $StartMinute -Second 0
 $trigger  = New-ScheduledTaskTrigger -Once -At $startAt `
                 -RepetitionInterval $interval -RepetitionDuration $duration
 
@@ -46,11 +56,11 @@ Register-ScheduledTask `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
-    -Description "Sends a message to claude.ai every 5h2m starting 2:32 AM, headless, in the background." `
+    -Description "Sends a message to claude.ai on a fixed schedule, off-screen, in the background." `
     -Force | Out-Null
 
 Write-Host "Task '$TaskName' registered." -ForegroundColor Green
-Write-Host "First run: $startAt  then every 5h 2m."
+Write-Host "First run: $startAt  then every ${IntervalHours}h ${IntervalMinutes}m."
 Write-Host ""
 Write-Host "Useful commands:"
 Write-Host "  Run now:    Start-ScheduledTask -TaskName '$TaskName'"
