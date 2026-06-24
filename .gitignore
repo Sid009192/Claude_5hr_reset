@@ -13,6 +13,19 @@ wheels/
 pw-profile/
 conversation_url.txt
 
+# Secrets — NEVER commit. Keep .env.example (template) tracked.
+.env
+.env.*
+!.env.example
+
+# Notification system: local config + runtime state
+notify_config.local.toml
+last_reset.txt
+digest_staged.txt
+
+# Google Calendar OAuth token cache (contains refresh token — NEVER commit)
+token.json
+
 # Markdown notes — ignore all except the GitHub README
 *.md
 !README.md

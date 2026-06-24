@@ -1,0 +1,31 @@
+# Copy to "notify_config.local.toml" and adjust. The .local copy is gitignored.
+# All times are your machine's local time. Telegram secrets go in .env, not here.
+
+# Window length: reset = open + this. The real Claude window is 5h00m.
+window_minutes = 300
+# Auto-sender cadence: next open = open + this. 5h00m30s. Must match setup_task.ps1.
+send_interval_seconds = 18030
+
+# Bootstrap anchor: a recent REAL window-open (send) time, ISO format. Used only
+# until autosend.py stamps last_reset.txt on its next send (then that takes over).
+seed_anchor = "2026-01-01T09:00:00"
+
+[quiet_hours]
+# No pings fire inside this range.
+start = "03:00"
+end   = "09:00"
+
+[pings]
+# Minutes before each reset to ping (e.g. 2h and 1.5h heavy-work warnings).
+lead_minutes = [120, 90]
+
+[digest]
+prep_hour    = 20   # ~8 PM: compute + stage tomorrow's digest
+publish_hour = 0    # 12 AM: send the staged digest
+
+[calendar]
+# Push each day's heavy-work (golden) slots to Google Calendar as events.
+sync_on_publish = true              # also sync when `digest.py --publish` runs
+calendar_id     = "primary"         # which calendar to write to
+timezone        = "Asia/Kolkata"    # IANA tz for the event times
+# OAuth client id/secret live in .env (gitignored), not here.

@@ -10,19 +10,20 @@ Usage
 1. One-time login (opens a visible window so you can sign in once):
        uv run python autosend.py --login
 
-2. Run the scheduler (keeps sending on the configured schedule):
-       uv run python autosend.py
-
-Stop it any time with Ctrl+C.
+2. Sends are driven one-shot by Windows Task Scheduler:
+       uv run python autosend.py --once
 """
 
 import argparse
+import re
+import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+import reset_schedule as rs  # shared schedule core (window length, last_reset path)
 
 # --------------------------------------------------------------------------- #
 # CONFIG  --  edit these to taste
@@ -31,14 +32,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # The message that gets sent each time.
 MESSAGE = "hi"
 
-# First send happens today at this HH:MM (24-hour clock), then repeats.
-FIRST_RUN_HOUR = 19      # 7 PM
-FIRST_RUN_MINUTE = 20    # :20  -> 7:20 PM
-
-# Gap between sends: every 5 hours and 2 minutes.
-INTERVAL = timedelta(hours=5, minutes=2)
-
-# Hide the browser for --once / loop modes?
+# Hide the browser for --once?
 # claude.ai blocks true headless, so True does NOT use headless -- instead it
 # runs a REAL window parked off-screen (invisible to you, accepted by claude.ai).
 # Set to False only if you want to watch the window on-screen.
@@ -50,6 +44,15 @@ PROFILE_DIR = Path(__file__).parent / "pw-profile"
 # Remembers the single conversation we reuse, so we don't clutter chat history
 # with a new chat every time. Deleted/invalid chats are recreated automatically.
 CONVERSATION_FILE = Path(__file__).parent / "conversation_url.txt"
+
+# Ground-truth anchor for the notification system. Written after each scheduled
+# send by reading the REAL reset off claude.ai's usage page (and by --autosync),
+# so reset_schedule.py never drifts. Read by the toast/telegram/digest scripts.
+LAST_RESET_FILE = Path(__file__).parent / "last_reset.txt"
+
+# The re-arm "brain": after each send we re-pin the next send + ping triggers to
+# the freshly-updated anchor (Option A self-rescheduling). See schedule_rearm.ps1.
+REARM_SCRIPT = Path(__file__).parent / "schedule_rearm.ps1"
 
 # claude.ai URLs
 NEW_CHAT_URL = "https://claude.ai/new"
@@ -147,7 +150,9 @@ def send_message(page) -> None:
     page.wait_for_timeout(300)
     page.keyboard.press("Enter")
     log(f"Sent message: {MESSAGE!r}")
-    # Give the request a moment to actually fire before we move on.
+    # Give the request a moment to actually fire before we move on. The anchor is
+    # written separately by _anchor_after_send() using the usage page (ground
+    # truth), NOT a naive 'now' -- a send can land mid-window and not reset.
     page.wait_for_timeout(3_000)
 
     # If this was a new chat, claude.ai navigates to /chat/<id>. Remember it so
@@ -155,28 +160,6 @@ def send_message(page) -> None:
     if is_new_chat and "/chat/" in page.url:
         CONVERSATION_FILE.write_text(page.url, encoding="utf-8")
         log(f"Saved conversation for reuse: {page.url}")
-
-
-def next_run_after(now: datetime) -> datetime:
-    """First scheduled time today at FIRST_RUN_HOUR:MINUTE, advanced by INTERVAL
-    until it is in the future."""
-    run = now.replace(
-        hour=FIRST_RUN_HOUR, minute=FIRST_RUN_MINUTE, second=0, microsecond=0
-    )
-    while run <= now:
-        run += INTERVAL
-    return run
-
-
-def sleep_until(target: datetime) -> None:
-    """Sleep until target, waking every 30s so Ctrl+C stays responsive and we
-    can print a countdown."""
-    while True:
-        remaining = (target - datetime.now()).total_seconds()
-        if remaining <= 0:
-            return
-        log(f"Next send at {target:%Y-%m-%d %H:%M:%S}  (in {remaining/3600:.2f} h)")
-        time.sleep(min(remaining, 30))
 
 
 def run_test() -> None:
@@ -221,7 +204,8 @@ def run_once() -> None:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         exit_code = 0
         try:
-            send_message(page)
+            _smart_sync(page)          # scrape usage, send only if it opens a window
+            _rearm()                   # re-pin next send + pings to the new anchor
         except PWTimeout:
             log("Could not find the chat box — you may be logged out, or claude.ai "
                 "blocked headless mode. Try  --login  and/or set HEADLESS = False.")
@@ -237,7 +221,145 @@ def run_once() -> None:
         sys.exit(exit_code)
 
 
-def run_loop() -> None:
+# --------------------------------------------------------------------------- #
+# --autosync : re-anchor last_reset.txt to the REAL window
+# --------------------------------------------------------------------------- #
+
+def _parse_reset_clock(s: str, now: datetime | None = None) -> datetime | None:
+    """Parse a clock time like '12:39 AM' or '23:50' into the NEXT future
+    datetime with that time (reset times are always ahead of now)."""
+    now = now or datetime.now()
+    m = re.search(r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])", s)
+    if m:
+        hh = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
+        mm = int(m.group(2))
+    else:
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", s)
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if hh > 23 or mm > 59:
+            return None
+    cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    while cand <= now:
+        cand += timedelta(days=1)
+    return cand
+
+
+# claude.ai surfaces the rolling 5h window reset on the usage page as a RELATIVE
+# string ("Resets in 30 min") under "Plan usage limits". The weekly cap shows as
+# "Resets <Day> H:MM" -- which we ignore (it has no " in ").
+USAGE_URL = "https://claude.ai/settings/usage"
+
+
+def _parse_relative(s: str) -> timedelta | None:
+    """'30 min' / '2 hours 15 min' / '1 hour' -> timedelta. None if unparseable."""
+    s = s.lower()
+    h = re.search(r"(\d+)\s*(?:hours?|hrs?)", s)
+    mi = re.search(r"(\d+)\s*min", s)
+    if not h and not mi:
+        if "less than" in s or "moment" in s or "soon" in s:
+            return timedelta(0)
+        return None
+    return timedelta(hours=int(h.group(1)) if h else 0,
+                     minutes=int(mi.group(1)) if mi else 0)
+
+
+def _scrape_reset(page) -> datetime | None:
+    """Open the usage page and read the rolling 5h window reset ('Resets in X').
+    Returns an absolute datetime (now + X), or None if it isn't shown."""
+    try:
+        page.goto(USAGE_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(3_500)
+        text = page.inner_text("body")
+    except Exception as e:
+        log(f"Usage page failed to load: {e!r}")
+        return None
+    m = re.search(r"resets?\s+in\s+([^\n]+)", text, re.I)
+    if m:
+        dur = _parse_relative(m.group(1))
+        if dur is not None:
+            reset = datetime.now() + dur
+            log(f"Usage page: 'Resets in {m.group(1).strip()[:30]}' -> reset {reset:%Y-%m-%d %H:%M}")
+            return reset
+    log("Usage page loaded but no rolling 'Resets in ...' found.")
+    return None
+
+
+def _write_anchor(open_dt: datetime) -> None:
+    """Write the window-open anchor and show the derived reset, so you can see
+    last_reset.txt update."""
+    window = rs.load_config().window
+    LAST_RESET_FILE.write_text(open_dt.isoformat(timespec="seconds"), encoding="utf-8")
+    log(f"last_reset.txt updated -> window open {open_dt:%Y-%m-%d %H:%M} "
+        f"(resets {(open_dt + window):%Y-%m-%d %H:%M})")
+
+
+def _rearm() -> None:
+    """Re-pin the next send + ping triggers to the just-updated anchor. Runs the
+    PowerShell brain with no console window. Non-fatal: a failed re-arm is caught
+    by the at-logon watchdog and the next run, so it must never crash the send."""
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(REARM_SCRIPT)],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=90, capture_output=True, text=True,
+        )
+        log("Re-armed next send + ping triggers.")
+    except Exception as e:
+        log(f"Re-arm failed (non-fatal): {e!r}")
+
+
+def _smart_sync(page) -> None:
+    """The self-syncing scheduled routine. Reads the usage page and keeps
+    last_reset.txt true, sending a message only when it actually opens a window:
+
+      * window active (reset > 1 min away): record the anchor, no wasted send.
+      * reset < 1 min away: FAIL-SAFE -- wait past the reset, then send so the
+        message opens the NEW window (never a dying one).
+      * no reset shown (window expired/inactive): send to open a window, re-read.
+    """
+    window = rs.load_config().window
+    reset = _scrape_reset(page)
+
+    if reset is not None:
+        secs = (reset - datetime.now()).total_seconds()
+        if secs >= 60:
+            log(f"Window active; resets in {secs/60:.0f} min. Recording anchor, no send.")
+            _write_anchor(reset - window)
+            return
+        wait_s = max(secs, 0) + 5   # a few seconds past the reset
+        log(f"Reset in {secs:.0f}s (<1 min). Fail-safe: waiting {wait_s:.0f}s so the "
+            f"send opens the new window.")
+        page.wait_for_timeout(int(wait_s * 1000))
+    else:
+        log("No reset shown (window not active). Sending a message to open a window.")
+
+    # Send (reused chat), then read the fresh window's reset and anchor to it.
+    send_message(page)
+    reset = _scrape_reset(page)
+    if reset is not None:
+        _write_anchor(reset - window)
+    else:
+        log("Usage page still unreadable after send; anchoring to now.")
+        _write_anchor(datetime.now())
+
+
+def run_autosync(reset_str: str | None) -> None:
+    """Re-sync the shared anchor. With an explicit reset time, anchor = reset -
+    window. Without one, scrape claude.ai; if no reset is shown, send a message
+    to open a fresh window and anchor to that send."""
+    window = rs.load_config().window
+
+    if reset_str:
+        dt = _parse_reset_clock(reset_str)
+        if not dt:
+            log(f"Could not parse {reset_str!r}. Use HH:MM or 'H:MM AM/PM'.")
+            sys.exit(1)
+        _write_anchor(dt - window)
+        return
+
     if not PROFILE_DIR.exists():
         log("No saved session found. Run first:  uv run python autosend.py --login")
         sys.exit(1)
@@ -245,33 +367,32 @@ def run_loop() -> None:
     with sync_playwright() as p:
         ctx = open_context(p, hidden=HEADLESS)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
-        # Verify we're actually logged in before committing to the loop.
         try:
             page.goto(NEW_CHAT_URL, wait_until="domcontentloaded")
             page.locator(EDITOR_SELECTOR).first.wait_for(state="visible", timeout=30_000)
+
+            dt = _scrape_reset(page)
+            if dt:
+                _write_anchor(dt - window)
+                return
+
+            log("No reset time on the page (no active limit, or window not begun). "
+                "Sending a message to open a fresh window, then re-checking.")
+            send_message(page)            # this also stamps last_reset.txt = now
+            page.wait_for_timeout(2_000)
+            dt2 = _scrape_reset(page)
+            if dt2:
+                _write_anchor(dt2 - window)
+            else:
+                log("Still no reset time shown; anchored to this send (now). If you "
+                    "were mid-window, correct with:  autosend.py --autosync <reset HH:MM>")
         except PWTimeout:
-            log("Could not find the chat box. You may be logged out, or claude.ai "
-                "is blocking headless mode.")
-            log("Fix: run  uv run python autosend.py --login  (and/or set HEADLESS = False).")
-            ctx.close()
-            sys.exit(1)
-
-        log("Logged in and ready. Scheduler running. Press Ctrl+C to stop.")
-
-        next_run = next_run_after(datetime.now())
-        try:
-            while True:
-                sleep_until(next_run)
-                try:
-                    send_message(page)
-                except Exception as e:  # don't let one failure kill the loop
-                    log(f"Send failed: {e!r}. Will try again next cycle.")
-                next_run += INTERVAL
-        except KeyboardInterrupt:
-            log("Stopped by user.")
+            log("Could not load claude.ai (logged out?). Try  uv run python autosend.py --login")
         finally:
-            ctx.close()
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
 
 def main() -> None:
@@ -282,6 +403,10 @@ def main() -> None:
                         help="Send one message right now (visible) to verify the setup, then exit.")
     parser.add_argument("--once", action="store_true",
                         help="Send one message headless and exit. Used by Windows Task Scheduler.")
+    parser.add_argument("--autosync", nargs="?", const="", default=None, metavar="HH:MM",
+                        help="Re-anchor the schedule. With a reset time (e.g. --autosync 12:39) "
+                             "it uses that; bare --autosync scrapes claude.ai, sending a message "
+                             "to open a window if none is active.")
     args = parser.parse_args()
 
     if args.login:
@@ -290,8 +415,10 @@ def main() -> None:
         run_test()
     elif args.once:
         run_once()
+    elif args.autosync is not None:
+        run_autosync(args.autosync or None)
     else:
-        run_loop()
+        parser.print_help()
 
 
 if __name__ == "__main__":
