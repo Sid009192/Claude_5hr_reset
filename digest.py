@@ -3,12 +3,17 @@ digest.py
 =========
 Daily plan-your-day digest of Claude windows, in the prepare-then-publish style:
 
-    uv run python digest.py --prep       # ~8 PM: build TOMORROW's digest, stage it
-    uv run python digest.py --publish    # 12 AM: send the staged digest via Telegram
-    uv run python digest.py              # (no flag) print TODAY's digest to stdout
+    uv run python digest.py --prep              # stage TODAY's digest (default)
+    uv run python digest.py --prep tomorrow     # stage TOMORROW's digest
+    uv run python digest.py --publish           # publish TODAY (Telegram + calendar)
+    uv run python digest.py --publish tomorrow  # publish TOMORROW
+    uv run python digest.py                     # (no flag) print TODAY's digest
 
-Both run one-shot from Windows Task Scheduler. Prep is silent (just stages a
-file); publish is what actually reaches you at midnight. Wallpaper rendering will
+Both --prep and --publish take an optional day: ``today`` (default) or
+``tomorrow``. Prep is silent (just stages a file, tagged with the day it is
+for); publish sends to Telegram AND pushes that SAME day's windows to Google
+Calendar -- both keyed off one resolved day, so the two channels can never
+disagree. Run one-shot from Windows Task Scheduler. Wallpaper rendering will
 hook into publish later.
 """
 
@@ -49,29 +54,59 @@ def build_digest(day: date, cfg: rs.Config, anchor: datetime) -> str:
     return "\n".join(lines)
 
 
+def _resolve_day(which: str) -> date:
+    """'today' | 'tomorrow' -> the matching date."""
+    return date.today() + timedelta(days=1) if which == "tomorrow" else date.today()
+
+
+def _read_staged() -> tuple[date, str] | None:
+    """Return (staged_day, text) from the staged file, or None if absent/legacy.
+    The staged file's first line is the ISO day it was prepped for."""
+    if not STAGED.exists():
+        return None
+    head, _, body = STAGED.read_text(encoding="utf-8").partition("\n")
+    try:
+        return date.fromisoformat(head.strip()), body
+    except ValueError:
+        return None  # no day header (legacy stage) -> treat as not usable
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Daily Claude window digest.")
-    ap.add_argument("--prep", action="store_true", help="Stage tomorrow's digest.")
-    ap.add_argument("--publish", action="store_true", help="Send the staged digest.")
+    ap.add_argument("--prep", nargs="?", const="today", choices=["today", "tomorrow"],
+                    default=None, metavar="WHEN",
+                    help="Stage the digest for today (default) or tomorrow.")
+    ap.add_argument("--publish", nargs="?", const="today", choices=["today", "tomorrow"],
+                    default=None, metavar="WHEN",
+                    help="Publish (Telegram + calendar) the digest for today (default) or tomorrow.")
     args = ap.parse_args()
 
     cfg = rs.load_config()
     anchor = rs.load_anchor(cfg)
 
-    if args.prep:
-        day = date.today() + timedelta(days=1)
-        STAGED.write_text(build_digest(day, cfg, anchor), encoding="utf-8")
+    if args.prep is not None:
+        day = _resolve_day(args.prep)
+        STAGED.write_text(f"{day.isoformat()}\n{build_digest(day, cfg, anchor)}",
+                          encoding="utf-8")
         print(f"[digest] staged for {day:%a %d %b}.")
-    elif args.publish:
-        text = STAGED.read_text(encoding="utf-8") if STAGED.exists() \
-            else build_digest(date.today(), cfg, anchor)
+    elif args.publish is not None:
+        day = _resolve_day(args.publish)
+        # Reuse the staged text only if it was prepped for THIS day; else rebuild
+        # fresh so Telegram and calendar always reflect the requested day.
+        staged = _read_staged()
+        if staged and staged[0] == day:
+            text = staged[1]
+        else:
+            text = build_digest(day, cfg, anchor)
+            if staged:
+                print(f"[digest] staged day {staged[0]:%d %b} != {day:%d %b}; rebuilt fresh.")
         ok = notify_telegram.send(text)
-        # Also push today's heavy-work windows to Google Calendar (if enabled).
-        # Kept separate from Telegram so a calendar hiccup never costs the ping.
+        # Push the SAME day's windows to Google Calendar (if enabled). Kept
+        # separate from Telegram so a calendar hiccup never costs the ping.
         n = 0
         if cfg.raw.get("calendar", {}).get("sync_on_publish", False):
-            n = notify_calendar.sync_day(date.today(), cfg, anchor)
-        print(f"[digest] published telegram={'ok' if ok else 'skip/fail'} "
+            n = notify_calendar.sync_day(day, cfg, anchor)
+        print(f"[digest] published {day:%a %d %b} telegram={'ok' if ok else 'skip/fail'} "
               f"calendar={n} event(s)")
     else:
         print(build_digest(date.today(), cfg, anchor))

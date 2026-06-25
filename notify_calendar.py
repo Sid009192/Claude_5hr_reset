@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as dtime
 from pathlib import Path
 
 import reset_schedule as rs
@@ -194,7 +194,58 @@ def _build_event(w: rs.Window, cfg: rs.Config, tz: str, idx: int = 0) -> dict:
         "colorId": COLOR_CYCLE[idx % len(COLOR_CYCLE)],
         "reminders": {"useDefault": False},
         "transparency": "transparent",       # doesn't block you as "busy"
+        # Tag so a reconcile can identify our events even if the summary changes.
+        "extendedProperties": {"private": {"claudeWindow": "1"}},
     }
+
+
+def _reconcile_day(service, calendar_id: str, day: date, wanted: set[str]) -> int:
+    """Delete our events on ``day`` whose id isn't in ``wanted`` -- the orphans
+    left behind when the schedule re-anchors and window-open times (hence event
+    ids) shift. Returns how many were removed. Never raises.
+
+    Matches our events by the 'claude' id prefix and keeps the scope to the
+    target day by the event's own local start date, so neighbouring days are
+    never touched. The query window is padded in UTC then filtered precisely."""
+    try:
+        from googleapiclient.errors import HttpError
+    except ImportError:
+        HttpError = Exception  # type: ignore
+
+    lo = (datetime.combine(day, dtime.min) - timedelta(days=1)).isoformat() + "Z"
+    hi = (datetime.combine(day, dtime.min) + timedelta(days=1)).isoformat() + "Z"
+    removed = 0
+    try:
+        resp = service.events().list(
+            calendarId=calendar_id, timeMin=lo, timeMax=hi,
+            singleEvents=True, maxResults=100,
+        ).execute()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[calendar] reconcile list failed ({exc}); skipping cleanup.")
+        return 0
+
+    for e in resp.get("items", []):
+        eid = e.get("id", "")
+        if not eid.startswith("claude") or eid in wanted:
+            continue
+        start = e.get("start", {}).get("dateTime")
+        if not start:
+            continue
+        try:
+            # Event is stored in IST, so its local date == the calendar day.
+            if datetime.fromisoformat(start).date() != day:
+                continue
+        except ValueError:
+            continue
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=eid).execute()
+            removed += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[calendar] could not delete orphan {eid}: {exc}")
+
+    if removed:
+        print(f"[calendar] removed {removed} orphaned event(s) for {day:%a %d %b}.")
+    return removed
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +281,7 @@ def sync_day(day: date, cfg: rs.Config | None = None,
     except ImportError:
         HttpError = Exception  # type: ignore
 
+    wanted = {_event_id(w.open) for w in wins}
     count = 0
     for idx, w in enumerate(wins):
         event = _build_event(w, cfg, tz, idx)
@@ -251,6 +303,10 @@ def sync_day(day: date, cfg: rs.Config | None = None,
                 print(f"[calendar] insert failed for {event['id']}: {exc}")
         except Exception as exc:  # noqa: BLE001 -- never raise.
             print(f"[calendar] unexpected error for {event['id']}: {exc}")
+
+    # Remove orphans from a previous (re-anchored) schedule so the day's events
+    # match the CURRENT windows exactly -- no stale duplicates.
+    _reconcile_day(service, calendar_id, day, wanted)
 
     print(f"[calendar] synced {count}/{len(wins)} window(s) for {day:%a %d %b}.")
     return count

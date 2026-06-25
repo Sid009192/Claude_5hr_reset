@@ -267,7 +267,15 @@ def _parse_relative(s: str) -> timedelta | None:
 
 def _scrape_reset(page) -> datetime | None:
     """Open the usage page and read the rolling 5h window reset ('Resets in X').
-    Returns an absolute datetime (now + X), or None if it isn't shown."""
+    Returns an absolute datetime (now + X), or None if no *rolling-window* reset
+    is shown.
+
+    The page lists MULTIPLE limits, including a weekly cap that can also read
+    'Resets in 18 hours'. Matching that by mistake writes a garbage future anchor
+    and suppresses the send (the bug that derailed the 2026-06-25 overnight run).
+    So we collect every 'Resets in X', discard any longer than the 5h window
+    (those are the weekly/other caps, never the rolling one), and take the
+    SOONEST remaining -- the rolling window -- regardless of page order."""
     try:
         page.goto(USAGE_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(3_500)
@@ -275,14 +283,27 @@ def _scrape_reset(page) -> datetime | None:
     except Exception as e:
         log(f"Usage page failed to load: {e!r}")
         return None
-    m = re.search(r"resets?\s+in\s+([^\n]+)", text, re.I)
-    if m:
-        dur = _parse_relative(m.group(1))
-        if dur is not None:
-            reset = datetime.now() + dur
-            log(f"Usage page: 'Resets in {m.group(1).strip()[:30]}' -> reset {reset:%Y-%m-%d %H:%M}")
-            return reset
-    log("Usage page loaded but no rolling 'Resets in ...' found.")
+
+    window = rs.load_config().window
+    cap = window + timedelta(minutes=5)        # small slack over a full window
+    candidates: list[timedelta] = []
+    for raw in re.findall(r"resets?\s+in\s+([^\n]+)", text, re.I):
+        dur = _parse_relative(raw)
+        if dur is None:
+            continue
+        if dur > cap:
+            log(f"Ignoring 'Resets in {raw.strip()[:30]}' ({dur}) -- longer than the "
+                f"{window} window, so it's the weekly/other cap, not the rolling one.")
+            continue
+        candidates.append(dur)
+
+    if candidates:
+        dur = min(candidates)                  # soonest in-window reset = rolling
+        reset = datetime.now() + dur
+        log(f"Usage page: rolling window resets in {dur} -> {reset:%Y-%m-%d %H:%M}")
+        return reset
+
+    log("Usage page loaded but no rolling (<= window) 'Resets in ...' found.")
     return None
 
 

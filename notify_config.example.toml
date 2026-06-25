@@ -23,6 +23,12 @@ lead_minutes = [120, 90]
 prep_hour    = 20   # ~8 PM: compute + stage tomorrow's digest
 publish_hour = 0    # 12 AM: send the staged digest
 
+[watchdog]
+# Delayed logon sync treats the chain as "dead" when now - anchor exceeds
+# send_interval + this grace (minutes). Above a normal cycle so a healthy chain
+# is never flagged. Only then does it re-scrape claude.ai at logon.
+stale_grace_minutes = 60
+
 [calendar]
 # Push each day's heavy-work (golden) slots to Google Calendar as events.
 sync_on_publish = true              # also sync when `digest.py --publish` runs

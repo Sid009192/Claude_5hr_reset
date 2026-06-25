@@ -168,6 +168,22 @@ def is_quiet(dt: datetime, cfg: Config) -> bool:
     return t >= qs or t < qe          # range wraps past midnight
 
 
+def is_stale(now: datetime, cfg: Config, anchor: datetime) -> bool:
+    """True if the anchor is too old to have come from a healthy self-arm chain.
+
+    A healthy chain re-anchors on every send, so the anchor never ages past one
+    ``send_interval`` (the next send re-pins it at exactly that point). Anything
+    beyond ``send_interval + grace`` means a send cycle was missed -- almost
+    always a full power-off where the chain died -- so a real re-sync (scrape the
+    usage page, re-anchor) is warranted rather than arming off the fossil anchor.
+
+    Grace (default 60 min) sits above the healthy ceiling so a punctual chain is
+    never flagged; override via ``[watchdog] stale_grace_minutes`` in the config.
+    """
+    grace_min = cfg.raw.get("watchdog", {}).get("stale_grace_minutes", 60)
+    return (now - anchor) > cfg.send_interval + timedelta(minutes=grace_min)
+
+
 # --------------------------------------------------------------------------- #
 # CLI -- for eyeballing / verifying the schedule
 # --------------------------------------------------------------------------- #
@@ -199,6 +215,9 @@ def main() -> None:
                     help="Print ONLY the next reset as ISO.")
     ap.add_argument("--arm-times", action="store_true",
                     help="Print next send + ping fire times as KEY=ISO (for schedule_rearm.ps1).")
+    ap.add_argument("--stale", action="store_true",
+                    help="Print STALE if the anchor implies a dead chain, else FRESH "
+                         "(for the delayed logon sync to decide whether to scrape).")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -207,6 +226,10 @@ def main() -> None:
 
     if args.reset_iso:
         print(next_reset(now, cfg, anchor).isoformat())
+        return
+
+    if args.stale:
+        print("STALE" if is_stale(now, cfg, anchor) else "FRESH")
         return
 
     if args.arm_times:
